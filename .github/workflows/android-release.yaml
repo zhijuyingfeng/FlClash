@@ -2,6 +2,15 @@ name: android release
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag; leave empty to build the APK artifact only
+        required: false
+        default: ''
+      prerelease:
+        description: Mark the release as a pre-release
+        type: boolean
+        default: false
 
 env:
   FLUTTER_VERSION: '3.47.6'
@@ -12,6 +21,8 @@ jobs:
   apk:
     name: Release APK
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
       KEYSTORE: ${{ secrets.KEYSTORE }}
     steps:
@@ -87,7 +98,33 @@ jobs:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
         run: flutter build apk --release --split-per-abi --dart-define=APP_ENV=stable
 
-      - name: Upload
+      - name: Stage release assets
+        if: inputs.tag != ''
+        run: |
+          version="$(sed -n 's/^version: *\([^+]*\).*/\1/p' pubspec.yaml)"
+          mkdir -p release-assets
+          for apk in build/app/outputs/flutter-apk/*.apk; do
+            abi="$(basename "$apk" | sed -e 's/^app-//' -e 's/-release\.apk$//')"
+            cp "$apk" "release-assets/FlClash-$version-$abi.apk"
+          done
+          sha256sum release-assets/*.apk > release-assets/sha256sums.txt
+
+      - name: Publish release
+        if: inputs.tag != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          args=()
+          if [ "$PRERELEASE" = "true" ]; then args+=(--prerelease); fi
+          gh release create "$TAG" release-assets/* \
+            --target "$GITHUB_SHA" \
+            --title "FlClash $TAG" \
+            --generate-notes \
+            "${args[@]}"
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: android-release
