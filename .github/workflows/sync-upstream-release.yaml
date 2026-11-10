@@ -79,17 +79,6 @@ jobs:
             exit 1
           fi
 
-      - name: Inspect token permissions
-        if: steps.resolve.outputs.pending == 'true'
-        env:
-          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
-        run: |
-          curl -sS -H "Authorization: Bearer $SYNC_TOKEN" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}" |
-            jq '{full_name, permissions}'
-          curl -sSI -H "Authorization: Bearer $SYNC_TOKEN" https://api.github.com/user |
-            tr -d '\r' | grep -iE '^x-(oauth-scopes|accepted-github-permissions):' || true
-
       - name: Push main
         if: steps.resolve.outputs.pending == 'true'
         env:
