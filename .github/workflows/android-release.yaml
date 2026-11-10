@@ -11,11 +11,23 @@ on:
         description: Mark the release as a pre-release
         type: boolean
         default: false
-
-env:
-  FLUTTER_VERSION: '3.47.6'
-  GO_VERSION: '1.27.1'
-  NDK_VERSION: r28c
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag; when set, the APKs become a GitHub release
+        required: false
+        type: string
+        default: ''
+      ref:
+        description: Git ref to build; defaults to the commit that triggered the run
+        required: false
+        type: string
+        default: ''
+      prerelease:
+        description: Mark the release as a pre-release
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   apk:
@@ -29,12 +41,40 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.ref || github.sha }}
           submodules: recursive
+
+      - name: Resolve commit
+        id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Read tool versions
+        id: tools
+        run: |
+          read_value() {
+            grep -m1 "^ *$1:" .github/workflows/build.yaml | sed -E "s/^[^:]+: *//; s/[\"']//g"
+          }
+          flutter="$(read_value FLUTTER_VERSION)"
+          go="$(read_value GO_VERSION)"
+          ndk="$(read_value NDK_VERSION)"
+          ca_bundle="$(read_value CA_BUNDLE)"
+          ca_sha="$(read_value CA_BUNDLE_SHA256)"
+          if [ -z "$flutter" ] || [ -z "$go" ] || [ -z "$ndk" ]; then
+            echo 'build.yaml does not declare FLUTTER_VERSION, GO_VERSION and NDK_VERSION' >&2
+            exit 1
+          fi
+          {
+            echo "flutter=$flutter"
+            echo "go=$go"
+            echo "ndk=$ndk"
+            echo "ca_bundle=$ca_bundle"
+            echo "ca_sha=$ca_sha"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version: ${{ steps.tools.outputs.go }}
           cache-dependency-path: |
             core/go.sum
             android/core/build.gradle.kts
@@ -43,14 +83,14 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: stable
-          flutter-version: ${{ env.FLUTTER_VERSION }}
+          flutter-version: ${{ steps.tools.outputs.flutter }}
           cache: true
 
       - name: Setup NDK
         uses: nttld/setup-ndk@v1
         id: ndk
         with:
-          ndk-version: ${{ env.NDK_VERSION }}
+          ndk-version: ${{ steps.tools.outputs.ndk }}
           link-to-sdk: true
 
       - name: Setup Java
@@ -86,9 +126,13 @@ jobs:
 
       - name: Fetch CA certificates
         env:
-          CA_BUNDLE: cacert-2026-09-25.pem
-          CA_BUNDLE_SHA256: a41b5d356aea97a529fe27e0f7316d2f9d946d75927476cf9cf1b90637d00505
+          CA_BUNDLE: ${{ steps.tools.outputs.ca_bundle }}
+          CA_BUNDLE_SHA256: ${{ steps.tools.outputs.ca_sha }}
         run: |
+          if [ -z "$CA_BUNDLE" ] || [ -z "$CA_BUNDLE_SHA256" ]; then
+            echo 'build.yaml does not declare CA_BUNDLE and CA_BUNDLE_SHA256' >&2
+            exit 1
+          fi
           bundle=core/Clash.Meta/component/ca/ca-certificates.crt
           curl -fsSL --retry 3 -o "$bundle" "https://curl.se/ca/$CA_BUNDLE"
           echo "$CA_BUNDLE_SHA256  $bundle" | sha256sum -c -
@@ -119,7 +163,7 @@ jobs:
           args=()
           if [ "$PRERELEASE" = "true" ]; then args+=(--prerelease); fi
           gh release create "$TAG" release-assets/* \
-            --target "$GITHUB_SHA" \
+            --target "${{ steps.commit.outputs.sha }}" \
             --title "FlClash $TAG" \
             --generate-notes \
             "${args[@]}"

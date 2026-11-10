@@ -1,0 +1,105 @@
+name: sync upstream release
+
+on:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: Upstream release tag; defaults to the latest stable release
+        required: false
+        default: ''
+      fork_tag:
+        description: Fork release tag; defaults to <upstream>-org.1
+        required: false
+        default: ''
+
+concurrency:
+  group: sync-upstream-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    name: Sync fork
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.fork_tag }}
+      pending: ${{ steps.resolve.outputs.pending }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Resolve tags
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+          INPUT_FORK_TAG: ${{ inputs.fork_tag }}
+        run: |
+          upstream_tag="$INPUT_UPSTREAM_TAG"
+          if [ -z "$upstream_tag" ]; then
+            upstream_tag="$(gh api repos/chen08209/FlClash/releases/latest --jq .tag_name)"
+          fi
+          fork_tag="$INPUT_FORK_TAG"
+          if [ -z "$fork_tag" ]; then
+            fork_tag="v${upstream_tag#v}-org.1"
+          fi
+          if gh release view "$fork_tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            pending=false
+          else
+            pending=true
+          fi
+          {
+            echo "upstream_tag=$upstream_tag"
+            echo "fork_tag=$fork_tag"
+            echo "pending=$pending"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Rebase the fork patch
+        if: steps.resolve.outputs.pending == 'true'
+        env:
+          UPSTREAM_TAG: ${{ steps.resolve.outputs.upstream_tag }}
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git fetch --no-tags https://github.com/chen08209/FlClash.git "+refs/tags/$UPSTREAM_TAG:refs/tags/$UPSTREAM_TAG"
+          if ! git merge-base --is-ancestor "$UPSTREAM_TAG" HEAD; then
+            git rebase "$UPSTREAM_TAG"
+          fi
+          if ! grep -q 'applicationId = "org.network.clash"' android/app/build.gradle.kts; then
+            echo 'android/app/build.gradle.kts no longer declares org.network.clash' >&2
+            exit 1
+          fi
+
+      - name: Push main
+        if: steps.resolve.outputs.pending == 'true'
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          if [ -z "$SYNC_TOKEN" ]; then
+            echo 'SYNC_TOKEN is missing: a workflow-scoped token is required to push upstream workflow changes' >&2
+            exit 1
+          fi
+          remote_sha="$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}.git" refs/heads/main | cut -f1)"
+          test -n "$remote_sha"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$SYNC_TOKEN" | base64 -w0)" \
+            push --force-with-lease=refs/heads/main:"$remote_sha" \
+            "https://github.com/${GITHUB_REPOSITORY}.git" HEAD:main
+
+  apk:
+    name: Build and publish
+    needs: sync
+    if: needs.sync.outputs.pending == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/android-release.yaml
+    with:
+      tag: ${{ needs.sync.outputs.tag }}
+      ref: main
+    secrets: inherit
