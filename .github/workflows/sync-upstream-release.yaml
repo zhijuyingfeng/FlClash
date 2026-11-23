@@ -1,9 +1,6 @@
 name: sync upstream release
 
 on:
-  schedule:
-    # 05:00 Asia/Shanghai; GitHub cron is UTC.
-    - cron: '0 21 * * *'
   workflow_dispatch:
     inputs:
       upstream_tag:
