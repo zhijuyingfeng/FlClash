@@ -1,0 +1,176 @@
+name: android release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag; leave empty to build the APK artifact only
+        required: false
+        default: ''
+      prerelease:
+        description: Mark the release as a pre-release
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag; when set, the APKs become a GitHub release
+        required: false
+        type: string
+        default: ''
+      ref:
+        description: Git ref to build; defaults to the commit that triggered the run
+        required: false
+        type: string
+        default: ''
+      prerelease:
+        description: Mark the release as a pre-release
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  apk:
+    name: Release APK
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      KEYSTORE: ${{ secrets.KEYSTORE }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          submodules: recursive
+
+      - name: Resolve commit
+        id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Read tool versions
+        id: tools
+        run: |
+          read_value() {
+            grep -m1 "^ *$1:" .github/workflows/build.yaml | sed -E "s/^[^:]+: *//; s/[\"']//g"
+          }
+          flutter="$(read_value FLUTTER_VERSION)"
+          go="$(read_value GO_VERSION)"
+          ndk="$(read_value NDK_VERSION)"
+          ca_bundle="$(read_value CA_BUNDLE)"
+          ca_sha="$(read_value CA_BUNDLE_SHA256)"
+          if [ -z "$flutter" ] || [ -z "$go" ] || [ -z "$ndk" ]; then
+            echo 'build.yaml does not declare FLUTTER_VERSION, GO_VERSION and NDK_VERSION' >&2
+            exit 1
+          fi
+          {
+            echo "flutter=$flutter"
+            echo "go=$go"
+            echo "ndk=$ndk"
+            echo "ca_bundle=$ca_bundle"
+            echo "ca_sha=$ca_sha"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ steps.tools.outputs.go }}
+          cache-dependency-path: |
+            core/go.sum
+            android/core/build.gradle.kts
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ steps.tools.outputs.flutter }}
+          cache: true
+
+      - name: Setup NDK
+        uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: ${{ steps.tools.outputs.ndk }}
+          link-to-sdk: true
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Configure Gradle
+        run: |
+          wrapper="$FLUTTER_ROOT/bin/cache/artifacts/gradle_wrapper"
+          test -d "$wrapper" || flutter precache
+          cp "$wrapper/gradlew" android/gradlew
+          mkdir -p android/gradle/wrapper
+          cp "$wrapper/gradle/wrapper/gradle-wrapper.jar" android/gradle/wrapper/
+          chmod +x android/gradlew
+          {
+            echo "flutter.sdk=$FLUTTER_ROOT"
+            echo "sdk.dir=$ANDROID_HOME"
+            if [ -n "$KEYSTORE" ]; then
+              echo "$KEYSTORE" | base64 --decode > android/app/keystore.jks
+              echo "storePassword=${{ secrets.STORE_PASSWORD }}"
+              echo "keyAlias=${{ secrets.KEY_ALIAS }}"
+              echo "keyPassword=${{ secrets.KEY_PASSWORD }}"
+            fi
+          } > android/local.properties
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Fetch CA certificates
+        env:
+          CA_BUNDLE: ${{ steps.tools.outputs.ca_bundle }}
+          CA_BUNDLE_SHA256: ${{ steps.tools.outputs.ca_sha }}
+        run: |
+          if [ -z "$CA_BUNDLE" ] || [ -z "$CA_BUNDLE_SHA256" ]; then
+            echo 'build.yaml does not declare CA_BUNDLE and CA_BUNDLE_SHA256' >&2
+            exit 1
+          fi
+          bundle=core/Clash.Meta/component/ca/ca-certificates.crt
+          curl -fsSL --retry 3 -o "$bundle" "https://curl.se/ca/$CA_BUNDLE"
+          echo "$CA_BUNDLE_SHA256  $bundle" | sha256sum -c -
+
+      - name: Build APK
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: flutter build apk --release --split-per-abi --dart-define=APP_ENV=stable
+
+      - name: Stage release assets
+        if: inputs.tag != ''
+        run: |
+          version="$(sed -n 's/^version: *\([^+]*\).*/\1/p' pubspec.yaml)"
+          mkdir -p release-assets
+          for apk in build/app/outputs/flutter-apk/*.apk; do
+            abi="$(basename "$apk" | sed -e 's/^app-//' -e 's/-release\.apk$//')"
+            cp "$apk" "release-assets/FlClash-$version-$abi.apk"
+          done
+          sha256sum release-assets/*.apk > release-assets/sha256sums.txt
+
+      - name: Publish release
+        if: inputs.tag != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          args=()
+          if [ "$PRERELEASE" = "true" ]; then args+=(--prerelease); fi
+          gh release create "$TAG" release-assets/* \
+            --target "${{ steps.commit.outputs.sha }}" \
+            --title "FlClash $TAG" \
+            --generate-notes \
+            "${args[@]}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-release
+          path: build/app/outputs/flutter-apk/*.apk
+          overwrite: true
